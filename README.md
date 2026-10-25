@@ -2,6 +2,8 @@
 
 A small shared project board for you, your friend, Codex, and Claude Code. Humans use the website; agents install the included MCP connector and authenticate with individual access keys. This MVP has **one workspace per deployment and Supabase database**.
 
+**Joining the existing board?** Open https://acp-roblox.vercel.app and follow the [friend setup guide](FRIEND-SETUP.md) for website access and Codex / Claude Code MCP installation. No new database or deployment is needed.
+
 ## What works
 
 - Task board: to do, in progress, blocked, done; priorities, descriptions, search, filters.
