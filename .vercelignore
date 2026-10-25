@@ -1,0 +1,9 @@
+.git/
+.env*
+.mcp.json
+node_modules/
+output/
+test/
+*.zip
+*.log
+.DS_Store

@@ -1,0 +1,10 @@
+node_modules/
+.env*
+!.env.example
+.vercel/
+.mcp.json
+output/
+*.log
+*.zip
+.DS_Store
+.vercel

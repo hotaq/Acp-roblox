@@ -1,0 +1,19 @@
+{
+  "name": "partyboard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "22.x"
+  },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env server.js",
+    "demo": "node server.js --demo",
+    "mcp": "node mcp.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@supabase/server": "1.9.2"
+  }
+}
