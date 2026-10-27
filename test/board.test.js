@@ -99,6 +99,72 @@ test('trust boundaries reject invalid input, origins, demo hosts, and large bodi
   assert.equal(page.headers['cache-control'], 'no-store');
 });
 
+test('tasks can be assigned to anyone in the workspace; only the owner can take them from someone else', async () => {
+  const { request, issue } = await fixture();
+  const mint = await issue('Mint', 'member'), codex = await issue('Codex');
+  const board = (await request('/api/board', { token: mint.secret })).body;
+  assert.deepEqual(board.people.map(p => p.name), ['Workspace owner', 'Mint', 'Codex']);
+  assert.ok(!JSON.stringify(board.people).includes('key_hash'));
+  const task = (await request('/api/tasks', { method: 'POST', body: { title: 'Orbit Rocks' } })).body;
+  const assign = (token, assignee_id) => request(`/api/tasks/${task.id}`, { method: 'PATCH', token, body: { action: 'assign', assignee_id } });
+  assert.equal((await assign(mint.secret, randomUUID())).status, 400);
+  const given = await assign(mint.secret, codex.id);
+  assert.equal(given.body.assignee_name, 'Codex'); assert.equal(given.body.status, 'in_progress');
+  assert.equal((await request('/api/board')).body.activity[0].body, 'Mint assigned this to Codex');
+  assert.equal((await assign(mint.secret, mint.id)).status, 409);
+  assert.equal((await assign(codex.secret, mint.id)).body.assignee_name, 'Mint');
+  assert.equal((await assign('test-owner-key', 'owner')).body.assignee_id, 'owner');
+  await request(`/api/tasks/${task.id}`, { method: 'PATCH', body: { action: 'status', status: 'done' } });
+  assert.equal((await assign('test-owner-key', codex.id)).status, 409);
+  await request(`/api/keys/${codex.id}`, { method: 'DELETE' });
+  assert.ok(!(await request('/api/board')).body.people.some(p => p.id === codex.id));
+});
+
+test('idea notes: anyone can stick and move notes; only the author or owner edits or deletes', async () => {
+  const { request, issue } = await fixture();
+  const mint = await issue('Mint', 'member'), codex = await issue('Codex');
+  const stuck = await request('/api/notes', { method: 'POST', token: mint.secret, body: { body: 'Goblin king boss', x: 120, y: 80 } });
+  assert.equal(stuck.status, 201); assert.equal(stuck.body.color, 'yellow'); assert.equal(stuck.body.author_name, 'Mint');
+  const note = (token, method, body) => request(`/api/notes/${stuck.body.id}`, { method, token, body });
+  assert.equal((await note(codex.secret, 'PATCH', { x: 400, y: 300 })).body.x, 400);
+  assert.equal((await note(codex.secret, 'PATCH', { body: 'Hijacked' })).status, 409);
+  assert.equal((await note(codex.secret, 'DELETE')).status, 409);
+  assert.equal((await note(mint.secret, 'PATCH', { color: 'pink' })).body.color, 'pink');
+  for (const bad of [{ x: -1 }, { y: 1.5 }, { color: 'red' }, { body: '' }, {}]) assert.equal((await note(mint.secret, 'PATCH', bad)).status, 400);
+  assert.equal((await request('/api/notes', { method: 'POST', body: { body: 'x'.repeat(501) } })).status, 400);
+  const [saved] = (await request('/api/board', { token: codex.secret })).body.notes;
+  assert.deepEqual([saved.x, saved.y, saved.color, saved.body], [400, 300, 'pink', 'Goblin king boss']);
+  assert.equal((await note('test-owner-key', 'DELETE')).status, 200);
+  assert.equal((await request('/api/board')).body.notes.length, 0);
+});
+
+test('new notes never overlap or repeat; image notes and links work and clean up with their note', async () => {
+  const { request, issue } = await fixture();
+  const mint = await issue('Mint', 'member');
+  const stick = (body, extra = {}, token = mint.secret) => request('/api/notes', { method: 'POST', token, body: { body, ...extra } });
+  const placed = [];
+  for (const body of ['A', 'B', 'C', 'D']) placed.push((await stick(body, { x: 100, y: 100 })).body);
+  const overlaps = (a, b) => a.x < b.x + 210 && b.x < a.x + 210 && a.y < b.y + 200 && b.y < a.y + 200;
+  assert.ok(placed.every((a, i) => placed.every((b, j) => i === j || !overlaps(a, b))));
+  assert.equal((await stick(' a ')).status, 409);
+  const pic = await stick('', { image_base64: png.toString('base64') });
+  assert.equal(pic.status, 201); assert.match(pic.body.image_id, /\.png$/);
+  assert.equal((await request(`/api/images/${pic.body.image_id}`)).status, 200);
+  assert.equal((await stick('')).status, 400);
+  const link = (from_id, to_id, label, token = mint.secret) => request('/api/links', { method: 'POST', token, body: { from_id, to_id, label } });
+  const made = await link(placed[0].id, pic.body.id, 'needs');
+  assert.equal(made.status, 201); assert.equal(made.body.created_by, 'Mint');
+  assert.equal((await link(pic.body.id, placed[0].id)).status, 409);
+  assert.equal((await link(placed[0].id, placed[0].id)).status, 400);
+  assert.equal((await link(placed[0].id, randomUUID())).status, 404);
+  const other = await link(placed[1].id, placed[2].id, '', 'test-owner-key');
+  assert.equal((await request(`/api/links/${other.body.id}`, { method: 'DELETE', token: mint.secret })).status, 409);
+  assert.equal((await request(`/api/notes/${pic.body.id}`, { method: 'DELETE', token: mint.secret })).status, 200);
+  const board = (await request('/api/board')).body;
+  assert.deepEqual(board.links.map(l => l.id), [other.body.id]);
+  assert.equal((await request(`/api/images/${pic.body.image_id}`)).status, 404);
+});
+
 test('two official SDK MCP clients exchange task ownership, handoff, and revocation through the API', async t => {
   const { issue, request, fetcher } = await fixture();
   const codex = await issue('Codex'), claude = await issue('Claude');
@@ -111,7 +177,7 @@ test('two official SDK MCP clients exchange task ownership, handoff, and revocat
     return client;
   }
   const a = await connect(codex), b = await connect(claude);
-  assert.equal((await a.listTools()).tools.length, 7);
+  assert.equal((await a.listTools()).tools.length, 10);
   const created = await a.callTool({ name: 'create_task', arguments: { title: 'Test animation import', priority: 'high' } });
   const task = JSON.parse(created.content[0].text);
   assert.equal(task.title, 'Test animation import');
@@ -119,8 +185,17 @@ test('two official SDK MCP clients exchange task ownership, handoff, and revocat
   assert.equal((await b.callTool({ name: 'claim_task', arguments: { task_id: task.id } })).isError, true);
   const body = 'Handoff: imported the model; next verify scale in Studio. No gameplay check yet.';
   await a.callTool({ name: 'post_update', arguments: { task_id: task.id, kind: 'handoff', body } });
+  const rocks = JSON.parse((await a.callTool({ name: 'add_note', arguments: { body: 'Orbit Rocks', color: 'blue' } })).content[0].text);
+  const totem = JSON.parse((await a.callTool({ name: 'add_note', arguments: { body: 'Lightning Totem' } })).content[0].text);
+  assert.ok(!(await a.callTool({ name: 'link_notes', arguments: { from_id: rocks.id, to_id: totem.id, label: 'pairs with' } })).isError);
   const board = JSON.parse((await b.callTool({ name: 'get_board', arguments: {} })).content[0].text);
-  assert.equal(board.activity[0].body, body); assert.equal(board.activity[0].actor, 'Codex');
+  assert.deepEqual(board.notes.map(n => [n.body, n.color]), [['Orbit Rocks', 'blue'], ['Lightning Totem', 'yellow']]);
+  assert.deepEqual(board.links, [{ from: rocks.id, to: totem.id, label: 'pairs with' }]);
+  assert.equal(board.tasks[0].assignee, 'Codex'); assert.equal(board.tasks[0].description, '');
+  assert.equal(board.activity.length, 1); // claim/created events are left out of the digest
+  assert.equal(board.activity[0].body, body);
+  const thread = JSON.parse((await b.callTool({ name: 'get_board', arguments: { task_id: task.id } })).content[0].text);
+  assert.equal(thread.task.id, task.id); assert.deepEqual(thread.thread.map(p => p.kind), ['created', 'status', 'handoff']); assert.equal(board.activity[0].actor, 'Codex');
   await a.callTool({ name: 'release_task', arguments: { task_id: task.id } });
   assert.ok(!(await b.callTool({ name: 'claim_task', arguments: { task_id: task.id } })).isError);
   await request(`/api/keys/${claude.id}`, { method: 'DELETE' });
@@ -138,6 +213,13 @@ test('Supabase writes keep atomic claim/ownership filters and server-only creden
   assert.equal(JSON.parse(calls[0].options.body).assignee_id, actor.id);
   await store.changeTask(id, { action: 'status', status: 'done' }, actor);
   assert.ok(calls[1].url.endsWith(`&assignee_id=eq.${actor.id}`));
+  await store.changeTask(id, { action: 'assign', assignee: { id: 'owner', name: 'Workspace owner' } }, actor);
+  assert.ok(calls[2].url.endsWith(`&status=neq.done&or=(assignee_id.is.null,assignee_id.eq.${actor.id})`));
+  assert.equal(JSON.parse(calls[2].options.body).assignee_name, 'Workspace owner');
+  await store.changeNote(id, { x: 5 }, actor, false);
+  assert.ok(calls[3].url.endsWith(`board_notes?id=eq.${id}`));
+  await store.deleteNote(id, actor);
+  assert.ok(calls[4].url.endsWith(`&author_id=eq.${actor.id}`)); assert.equal(calls[4].options.method, 'DELETE');
   assert.equal(calls[0].options.headers.apikey, 'sb_secret_test');
   assert.equal(calls[0].options.headers.Authorization, undefined);
   const unavailable = supabaseStore('https://project.supabase.co', 'sb_secret_test', async () => { throw new Error('private internal detail'); });
@@ -152,7 +234,7 @@ test('the installed stdio connector launches and exposes its tools to a real SDK
   t.after(() => client.close());
   await client.connect(transport);
   assert.deepEqual((await client.listTools()).tools.map(tool => tool.name),
-    ['get_board', 'create_task', 'claim_task', 'set_task_status', 'release_task', 'post_update', 'view_image']);
+    ['get_board', 'create_task', 'claim_task', 'set_task_status', 'assign_task', 'release_task', 'post_update', 'add_note', 'link_notes', 'view_image']);
 });
 
 test('image updates round-trip privately, reject invalid uploads, and respect key revocation', async () => {

@@ -6,9 +6,16 @@ export class BoardError extends Error {
   constructor(status, message) { super(message); this.status = status; }
 }
 
-export async function memoryStore({ seed = false } = {}) {
-  const tasks = [], activity = [], keys = [], images = new Map();
-  let code = 0;
+// `data` preloads a board snapshot ({ tasks, activity, keys }), e.g. to preview the UI with real board content.
+export async function memoryStore({ seed = false, data = {} } = {}) {
+  const { tasks = [], activity = [], keys = [], notes = [], links = [] } = structuredClone(data), images = new Map();
+  const note = (id, actor, edit) => {
+    const found = notes.find(n => n.id === id);
+    if (!found) throw new BoardError(404, 'Note not found.');
+    if (edit && actor.role !== 'owner' && found.author_id !== actor.id) throw new BoardError(409, 'Only the note’s author or workspace owner can edit or delete it.');
+    return found;
+  };
+  let code = Math.max(0, ...tasks.map(t => t.code));
   const record = (task, kind, body, actor) => activity.unshift({
     id: randomUUID(), task_id: task?.id ?? null, task_code: task?.code ?? null,
     kind, body, actor: actor.name, created_at: new Date().toISOString(),
@@ -21,7 +28,33 @@ export async function memoryStore({ seed = false } = {}) {
       return { data: Buffer.from(image.data), mime: image.mime };
     },
     async deleteImage(id) { images.delete(id); },
-    async snapshot() { return structuredClone({ tasks, activity: activity.slice(0, 100) }); },
+    async snapshot() { return structuredClone({ tasks, activity: activity.slice(0, 100), notes, links }); },
+    async addNote(input, actor) {
+      const now = new Date().toISOString();
+      notes.push({ id: randomUUID(), ...input, author_id: actor.id, author_name: actor.name, created_at: now, updated_at: now });
+      return structuredClone(notes.at(-1));
+    },
+    async changeNote(id, patch, actor, edit) {
+      const found = note(id, actor, edit);
+      if (patch.body === '' && !found.image_id) throw new BoardError(400, 'Write an idea or attach an image.');
+      return structuredClone(Object.assign(found, patch, { updated_at: new Date().toISOString() }));
+    },
+    async deleteNote(id, actor) {
+      const found = note(id, actor, true);
+      notes.splice(notes.indexOf(found), 1);
+      links.splice(0, links.length, ...links.filter(l => l.from_id !== id && l.to_id !== id)); // like ON DELETE CASCADE
+      return structuredClone(found);
+    },
+    async addLink(input, actor) {
+      links.push({ id: randomUUID(), ...input, created_by_id: actor.id, created_by: actor.name, created_at: new Date().toISOString() });
+      return structuredClone(links.at(-1));
+    },
+    async deleteLink(id, actor) {
+      const i = links.findIndex(l => l.id === id);
+      if (i < 0) throw new BoardError(404, 'Link not found.');
+      if (actor.role !== 'owner' && links[i].created_by_id !== actor.id) throw new BoardError(409, 'Only whoever made the link or the workspace owner can remove it.');
+      links.splice(i, 1);
+    },
     async findKey(hash) { return structuredClone(keys.find(k => k.key_hash === hash && !k.revoked_at)); },
     async keys() { return structuredClone(keys); },
     async addKey(key) { keys.push(key); return key; },
@@ -43,13 +76,17 @@ export async function memoryStore({ seed = false } = {}) {
       if (change.action === 'claim') {
         if (task.assignee_id || task.status === 'done') throw new BoardError(409, 'This task is already claimed or complete.');
         Object.assign(task, { assignee_id: actor.id, assignee_name: actor.name, status: 'in_progress' });
+      } else if (change.action === 'assign') {
+        if (task.status === 'done' || (actor.role !== 'owner' && task.assignee_id && task.assignee_id !== actor.id)) throw new BoardError(409, 'Only the task owner or workspace owner can reassign this task.');
+        Object.assign(task, { assignee_id: change.assignee.id, assignee_name: change.assignee.name, status: 'in_progress' });
       } else {
         if (actor.role !== 'owner' && task.assignee_id !== actor.id) throw new BoardError(409, 'Only the task owner or workspace owner can change this task.');
         if (change.action === 'release') Object.assign(task, { assignee_id: null, assignee_name: null, status: 'todo' });
         else task.status = change.status;
       }
       task.updated_by = actor.name; task.updated_at = new Date().toISOString();
-      record(task, 'status', change.action === 'claim' ? `${actor.name} claimed this task` : change.action === 'release' ? 'Released this task to the backlog' : `Moved to ${task.status.replaceAll('_', ' ')}`, actor);
+      const claimed = change.action === 'claim' || (change.action === 'assign' && task.assignee_name === actor.name);
+      record(task, 'status', claimed ? `${actor.name} claimed this task` : change.action === 'assign' ? `${actor.name} assigned this to ${task.assignee_name}` : change.action === 'release' ? 'Released this task to the backlog' : `Moved to ${task.status.replaceAll('_', ' ')}`, actor);
       return structuredClone(task);
     },
     async postUpdate(input, actor) {
@@ -111,6 +148,7 @@ export function supabaseStore(url, secret, fetcher = fetch) {
     if (!response.ok) throw new BoardError(503, 'Database request failed. Check the server configuration and migration.');
     return response.status === 204 ? null : response.json();
   }
+  const noteQuery = (id, actor, edit) => `board_notes?id=eq.${id}${edit && actor.role !== 'owner' ? `&author_id=eq.${actor.id}` : ''}`;
   return {
     async uploadImage(id, data, mime) {
       await ensureBucket();
@@ -123,8 +161,9 @@ export function supabaseStore(url, secret, fetcher = fetch) {
     async deleteImage(id) { await checkStorage(await admin.storage.from(bucketName).remove([id])); },
     async snapshot() {
       // shortcut: latest 1000 tasks and 100 events, add pagination when the board outgrows one screen.
-      const [tasks, activity] = await Promise.all([rest('board_tasks?order=updated_at.desc&limit=1000'), rest('board_activity?order=created_at.desc&limit=100')]);
-      return { tasks, activity };
+      const [tasks, activity, notes, links] = await Promise.all([rest('board_tasks?order=updated_at.desc&limit=1000'), rest('board_activity?order=created_at.desc&limit=100'), rest('board_notes?order=created_at.asc&limit=500').catch(() => []) /* board stays usable before the notes migrations run */,
+        rest('board_note_links?order=created_at.asc&limit=1000').catch(() => [])]);
+      return { tasks, activity, notes, links };
     },
     async findKey(hash) { return (await rest(`board_keys?key_hash=eq.${hash}&revoked_at=is.null&limit=1`))[0]; },
     keys: () => rest('board_keys?order=created_at.desc'),
@@ -139,6 +178,10 @@ export function supabaseStore(url, secret, fetcher = fetch) {
       if (change.action === 'claim') {
         query += '&assignee_id=is.null&status=neq.done';
         Object.assign(patch, { assignee_id: actor.id, assignee_name: actor.name, status: 'in_progress' });
+      } else if (change.action === 'assign') {
+        query += '&status=neq.done';
+        if (actor.role !== 'owner') query += `&or=(assignee_id.is.null,assignee_id.eq.${actor.id})`;
+        Object.assign(patch, { assignee_id: change.assignee.id, assignee_name: change.assignee.name, status: 'in_progress' });
       } else {
         if (actor.role !== 'owner') query += `&assignee_id=eq.${actor.id}`;
         if (change.action === 'release') Object.assign(patch, { assignee_id: null, assignee_name: null, status: 'todo' });
@@ -148,6 +191,23 @@ export function supabaseStore(url, secret, fetcher = fetch) {
       const rows = await rest(query, 'PATCH', patch);
       if (!rows.length) throw new BoardError(409, 'Task unavailable. It may be claimed, complete, or owned by someone else.');
       return rows[0];
+    },
+    async addNote(input, actor) { return (await rest('board_notes', 'POST', { ...input, author_id: actor.id, author_name: actor.name }))[0]; },
+    // Moving is open to everyone; editing text/colour or deleting is filtered to the author unless the actor is the owner.
+    async changeNote(id, patch, actor, edit) {
+      const rows = await rest(noteQuery(id, actor, edit), 'PATCH', { ...patch, updated_at: new Date().toISOString() });
+      if (!rows.length) throw new BoardError(409, 'Note unavailable. It may be deleted or written by someone else.');
+      return rows[0];
+    },
+    async deleteNote(id, actor) {
+      const rows = await rest(noteQuery(id, actor, true), 'DELETE');
+      if (!rows.length) throw new BoardError(409, 'Note unavailable. It may be deleted or written by someone else.');
+      return rows[0];
+    },
+    async addLink(input, actor) { return (await rest('board_note_links', 'POST', { ...input, created_by_id: actor.id, created_by: actor.name }))[0]; },
+    async deleteLink(id, actor) {
+      const rows = await rest(`board_note_links?id=eq.${id}${actor.role === 'owner' ? '' : `&created_by_id=eq.${actor.id}`}`, 'DELETE');
+      if (!rows.length) throw new BoardError(409, 'Link unavailable. It may be removed or made by someone else.');
     },
     async postUpdate(input, actor) {
       if (input.task_id) {

@@ -76,7 +76,7 @@ Send your agent this message:
 
 > Use the Partyboard MCP tool get_board and tell me the board name and available tasks. Do not create or change anything yet.
 
-You should see seven tools: `get_board`, `create_task`, `claim_task`, `set_task_status`, `release_task`, `post_update`, and `view_image`. A successful `get_board` confirms both the connector and your key work.
+You should see ten tools: `get_board`, `create_task`, `claim_task`, `set_task_status`, `assign_task`, `release_task`, `post_update`, `add_note`, `link_notes`, and `view_image`. A successful `get_board` confirms both the connector and your key work.
 
 If it fails:
 

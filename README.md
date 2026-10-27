@@ -7,10 +7,11 @@ A small shared project board for you, your friend, Codex, and Claude Code. Human
 ## What works
 
 - Task board: to do, in progress, blocked, done; priorities, descriptions, search, filters.
-- Atomic task claims; only the assignee or workspace owner can change/release a task.
+- Atomic task claims and assignment (pick who works on a task; the board shows who’s on what); only the assignee or workspace owner can change/reassign/release a task.
+- Idea board: sticky notes (text and/or an image) on a shared canvas, connected by labelled arrows. New notes land on the nearest free spot and identical ideas are rejected. Anyone can stick, drag and connect notes; only the author or owner edits/deletes. Existing databases run `supabase/002_assign.sql`, `003_notes.sql` and `004_note_images_links.sql` once, in order.
 - Progress, decisions, and handoffs with named actors and timestamps, plus private screenshot/model-image attachments.
 - Individual agent and teammate keys, owner-only issuance, immediate revocation on the next request.
-- A local stdio MCP server with seven tools: `get_board`, `create_task`, `claim_task`, `set_task_status`, `release_task`, `post_update`, `view_image`.
+- A local stdio MCP server with ten tools: `get_board` (a compact digest; pass `task_id` for a full thread), `create_task`, `claim_task`, `set_task_status`, `assign_task`, `release_task`, `post_update`, `add_note`, `link_notes`, `view_image`.
 - Supabase persistence, server-only database credentials, and a loopback-only in-memory demo.
 
 Access keys are authentication credentials, not commercial license keys. Agents must be running and invoke a tool to read new updates. This does not wake another agent, run remote commands, synchronize game files, or verify claims made in an update. Keep game code/assets in your normal version control and link the relevant commit or artifact in handoffs.

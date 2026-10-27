@@ -8,6 +8,34 @@ import { MAX_IMAGE_BYTES, imageIdPattern, imageMarker, splitImages } from './pub
 
 export const hashKey = key => createHash('sha256').update(key).digest('hex');
 const statuses = ['todo', 'in_progress', 'blocked', 'done'];
+const noteColors = ['yellow', 'pink', 'blue', 'green', 'orange'];
+// Idea-board note fields; on create every field is set (with defaults), on update only the ones sent.
+function noteInput(input, create = false) {
+  const note = {};
+  if (create || input.body !== undefined) note.body = text(input.body, 'Note', 500, true); // may be empty when the note has an image
+  if (create || input.color !== undefined) note.color = choice(input.color ?? 'yellow', noteColors, 'colour');
+  for (const [axis, max] of [['x', 3000], ['y', 2000]]) if (create || input[axis] !== undefined) {
+    const value = input[axis] ?? 40;
+    if (!Number.isInteger(value) || value < 0 || value > max) throw new BoardError(400, `${axis} must be a whole number from 0 to ${max}.`);
+    note[axis] = value;
+  }
+  if (!Object.keys(note).length) throw new BoardError(400, 'Nothing to change.');
+  return note;
+}
+const NOTE_W = 250, NOTE_H = 210, NOTE_H_IMAGE = 310; // room a note takes up (with a margin) when placing new ones
+// The free grid spot nearest to `target`, so new notes never land on top of existing ones.
+// ponytail: brute-force grid scan (~6k spots × notes), fine for a few hundred notes; use a spatial index beyond that.
+function freeSpot(notes, tall, [tx, ty] = [40, 40]) {
+  const h = tall ? NOTE_H_IMAGE : NOTE_H;
+  let best = { x: 40, y: 40 }, bestDistance = Infinity;
+  for (let y = 20; y <= 2000 - h; y += 30) for (let x = 20; x <= 3000 - NOTE_W; x += 30) {
+    const distance = (x - tx) ** 2 + (y - ty) ** 2;
+    if (distance < bestDistance && notes.every(n => x + NOTE_W <= n.x || n.x + NOTE_W <= x || y + h <= n.y || n.y + (n.image_id ? NOTE_H_IMAGE : NOTE_H) <= y)) {
+      best = { x, y }; bestDistance = distance;
+    }
+  }
+  return best;
+}
 const uuid = value => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 const cleanKey = ({ key_hash, ...key }) => key;
 function text(value, name, max, optional = false) {
@@ -44,7 +72,9 @@ function decodeImage(encoded) {
 
 export function createApp({ store, ownerKey, name = 'Goblin game', demo = false, publicOrigin }) {
   const ownerHash = Buffer.from(hashKey(ownerKey), 'hex');
-  const rates = new Map();
+  const rates = new Map(), owner = { id: 'owner', name: 'Workspace owner', role: 'owner' };
+  // Everyone a task can be assigned to: the owner plus every active key. Never exposes key hashes.
+  const people = async () => [owner, ...(await store.keys()).filter(k => !k.revoked_at).map(({ id, name, role }) => ({ id, name, role }))];
   const files = new Map([['/', ['index.html', 'text/html']], ['/app.js', ['app.js', 'text/javascript']], ['/images.js', ['images.js', 'text/javascript']], ['/style.css', ['style.css', 'text/css']]]);
   const server = http.createServer(async (req, res) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -76,7 +106,7 @@ export function createApp({ store, ownerKey, name = 'Goblin game', demo = false,
       if (!token) throw new BoardError(401, 'Enter a valid workspace access key.');
       const hash = hashKey(token);
       const actor = timingSafeEqual(Buffer.from(hash, 'hex'), ownerHash)
-        ? { id: 'owner', name: 'Workspace owner', role: 'owner' }
+        ? owner
         : await store.findKey(hash);
       if (!actor) throw new BoardError(401, 'Access key is invalid or revoked.');
       const ownerOnly = () => { if (actor.role !== 'owner') throw new BoardError(403, 'Only the workspace owner can manage keys.'); };
@@ -89,8 +119,8 @@ export function createApp({ store, ownerKey, name = 'Goblin game', demo = false,
         return res.end(image.data);
       }
       if (req.method === 'GET' && path === '/api/board') {
-        const board = await store.snapshot();
-        return send(200, { ...board, activity: board.activity.map(update => ({ ...update, image_ids: splitImages(update.body).images })),
+        const [board, team] = await Promise.all([store.snapshot(), people()]);
+        return send(200, { ...board, people: team, activity: board.activity.map(update => ({ ...update, image_ids: splitImages(update.body).images })),
           actor: { id: actor.id, name: actor.name, role: actor.role }, name, demo });
       }
       if (path === '/api/keys') {
@@ -120,9 +150,46 @@ export function createApp({ store, ownerKey, name = 'Goblin game', demo = false,
       if (taskRoute && req.method === 'PATCH') {
         if (!uuid(taskRoute[1])) throw new BoardError(400, 'Invalid task ID.');
         const input = await readBody(req);
-        const change = { action: choice(input.action, ['claim', 'release', 'status'], 'action') };
+        const change = { action: choice(input.action, ['claim', 'release', 'status', 'assign'], 'action') };
         if (change.action === 'status') change.status = choice(input.status, statuses, 'status');
+        if (change.action === 'assign' && !(change.assignee = (await people()).find(p => p.id === input.assignee_id))) throw new BoardError(400, 'Unknown assignee.');
         return send(200, await store.changeTask(taskRoute[1], change, actor));
+      }
+      if (req.method === 'POST' && path === '/api/notes') {
+        const input = await readBody(req, Math.ceil(MAX_IMAGE_BYTES / 3) * 4 + 16384);
+        const image = input.image_base64 === undefined ? null : decodeImage(input.image_base64), note = noteInput(input, true);
+        if (!note.body && !image) throw new BoardError(400, 'Write an idea or attach an image.');
+        const { notes } = await store.snapshot();
+        if (note.body && notes.some(n => n.body.trim().toLowerCase() === note.body.toLowerCase())) throw new BoardError(409, 'That idea is already on the board.');
+        Object.assign(note, freeSpot(notes, !!image, input.x === undefined && input.y === undefined ? undefined : [note.x, note.y]));
+        if (image) { note.image_id = `${randomUUID()}.${image.ext}`; await store.uploadImage(note.image_id, image.data, image.mime); }
+        try { return send(201, await store.addNote(note, actor)); }
+        catch (error) { if (image) await store.deleteImage(note.image_id).catch(() => {}); throw error; }
+      }
+      const noteRoute = path.match(/^\/api\/notes\/([^/]+)$/);
+      if (noteRoute && ['PATCH', 'DELETE'].includes(req.method)) {
+        if (!uuid(noteRoute[1])) throw new BoardError(400, 'Invalid note ID.');
+        if (req.method === 'DELETE') {
+          const removed = await store.deleteNote(noteRoute[1], actor);
+          if (removed?.image_id) await store.deleteImage(removed.image_id).catch(() => {});
+          return send(200, { ok: true });
+        }
+        const patch = noteInput(await readBody(req));
+        return send(200, await store.changeNote(noteRoute[1], patch, actor, 'body' in patch || 'color' in patch));
+      }
+      if (req.method === 'POST' && path === '/api/links') {
+        const input = await readBody(req);
+        if (!uuid(input.from_id) || !uuid(input.to_id) || input.from_id === input.to_id) throw new BoardError(400, 'Pick two different notes to connect.');
+        const link = { from_id: input.from_id, to_id: input.to_id, label: text(input.label, 'Label', 60, true) };
+        const { notes, links } = await store.snapshot();
+        if (![link.from_id, link.to_id].every(id => notes.some(n => n.id === id))) throw new BoardError(404, 'Note not found.');
+        if (links.some(l => [l.from_id, l.to_id].sort().join() === [link.from_id, link.to_id].sort().join())) throw new BoardError(409, 'Those notes are already connected.');
+        return send(201, await store.addLink(link, actor));
+      }
+      const linkRoute = path.match(/^\/api\/links\/([^/]+)$/);
+      if (linkRoute && req.method === 'DELETE') {
+        if (!uuid(linkRoute[1])) throw new BoardError(400, 'Invalid link ID.');
+        await store.deleteLink(linkRoute[1], actor); return send(200, { ok: true });
       }
       if (req.method === 'POST' && path === '/api/updates') {
         const input = await readBody(req, Math.ceil(MAX_IMAGE_BYTES / 3) * 4 + 16384);
